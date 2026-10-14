@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release-type: ${{ steps.version.outputs.release-type }}
+      publish-curseforge: ${{ steps.version.outputs.publish-curseforge }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate publishing configuration and tag
+        id: version
+        env:
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_API_TOKEN }}
+          MODTALE_API_KEY: ${{ secrets.MODTALE_API_KEY }}
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_GAME_VERSION_IDS: ${{ vars.CURSEFORGE_GAME_VERSION_IDS }}
+          MODTALE_PROJECT_ID: ${{ vars.MODTALE_PROJECT_ID }}
+          MODTALE_GAME_VERSIONS: ${{ vars.MODTALE_GAME_VERSIONS }}
+        run: |
+          set -euo pipefail
+          for name in MODTALE_API_KEY MODTALE_PROJECT_ID MODTALE_GAME_VERSIONS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repository secret or variable: $name"
+              exit 1
+            fi
+          done
+          if [[ -z "$CURSEFORGE_API_TOKEN" ]]; then
+            echo "::notice::CURSEFORGE_API_TOKEN is not set; skipping CurseForge publishing."
+            echo "publish-curseforge=false" >> "$GITHUB_OUTPUT"
+          else
+            if [[ ! "$CURSEFORGE_PROJECT_ID" =~ ^[0-9]+$ || ! "$CURSEFORGE_GAME_VERSION_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+              echo "::error::Set a numeric CURSEFORGE_PROJECT_ID and comma-separated numeric CURSEFORGE_GAME_VERSION_IDS."
+              exit 1
+            fi
+            echo "publish-curseforge=true" >> "$GITHUB_OUTPUT"
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          # Strict SemVer, including optional prerelease and build metadata.
+          VERSION="$version" python3 - <<'PY'
+          import os, re
+          number = r'(?:0|[1-9][0-9]*)'
+          identifier = rf'(?:{number}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          pattern = rf'{number}\.{number}\.{number}(?:-{identifier}(?:\.{identifier})*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?'
+          if not re.fullmatch(pattern, os.environ['VERSION']):
+              raise SystemExit('Invalid tag: use v1.2.3 or v1.2.3-beta.1 (SemVer).')
+          PY
+          release_type=release
+          if [[ "${version%%+*}" == *-* ]]; then
+            release_type=beta
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release-type=$release_type" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Stamp version, build, and test
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mvn --batch-mode --no-transfer-progress org.codehaus.mojo:versions-maven-plugin:2.21.0:set \
+            -DnewVersion="$VERSION" -DgenerateBackupPoms=false
+          manifest=src/main/resources/manifest.json
+          jq --arg version "$VERSION" '.Version = $version' "$manifest" > "$RUNNER_TEMP/manifest.json"
+          cp "$RUNNER_TEMP/manifest.json" "$manifest"
+          mvn --batch-mode --no-transfer-progress clean verify
+          mkdir -p dist
+          cp "target/OrbZones-$VERSION.jar" dist/
+
+      - name: Create GitHub release and attach JAR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TYPE: ${{ steps.version.outputs.release-type }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            args=()
+            if [[ "$RELEASE_TYPE" == beta ]]; then
+              args+=(--prerelease --latest=false)
+            fi
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "OrbZones $VERSION" --generate-notes "${args[@]}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" "dist/OrbZones-$VERSION.jar" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq '.body' > dist/changelog.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  curseforge:
+    needs: release
+    if: needs.release.outputs.publish-curseforge == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+
+      - name: Publish to CurseForge
+        env:
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_API_TOKEN }}
+          PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          GAME_VERSION_IDS: ${{ vars.CURSEFORGE_GAME_VERSION_IDS }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TYPE: ${{ needs.release.outputs.release-type }}
+        run: |
+          set -euo pipefail
+          jq -n --rawfile changelog dist/changelog.md \
+            --arg name "OrbZones $VERSION" --arg releaseType "$RELEASE_TYPE" \
+            --arg ids "$GAME_VERSION_IDS" \
+            '{changelog: $changelog, changelogType: "markdown", displayName: $name,
+              releaseType: $releaseType, gameVersions: ($ids | split(",") | map(tonumber))}' \
+            > "$RUNNER_TEMP/curseforge-metadata.json"
+          curl --fail-with-body --silent --show-error --max-time 300 \
+            "https://legacy.curseforge.com/api/projects/$PROJECT_ID/upload-file" \
+            -H "X-Api-Token: $CURSEFORGE_API_TOKEN" \
+            -F "metadata=<$RUNNER_TEMP/curseforge-metadata.json;type=application/json" \
+            -F "file=@dist/OrbZones-$VERSION.jar;type=application/java-archive"
+
+  modtale:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+
+      - name: Publish to Modtale
+        env:
+          MODTALE_API_KEY: ${{ secrets.MODTALE_API_KEY }}
+          PROJECT_ID: ${{ vars.MODTALE_PROJECT_ID }}
+          GAME_VERSIONS: ${{ vars.MODTALE_GAME_VERSIONS }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TYPE: ${{ needs.release.outputs.release-type }}
+        run: |
+          set -euo pipefail
+          form=()
+          IFS=',' read -ra versions <<< "$GAME_VERSIONS"
+          for game_version in "${versions[@]}"; do
+            game_version="$(printf '%s' "$game_version" | xargs)"
+            if [[ -n "$game_version" ]]; then
+              form+=(--form-string "gameVersions=$game_version")
+            fi
+          done
+          if [[ ${#form[@]} -eq 0 ]]; then
+            echo "::error::MODTALE_GAME_VERSIONS must contain at least one supported game version."
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error --max-time 300 \
+            "https://api.modtale.net/api/v1/projects/$PROJECT_ID/versions" \
+            -H "X-MODTALE-KEY: $MODTALE_API_KEY" \
+            --form-string "versionNumber=$VERSION" \
+            --form-string "channel=${RELEASE_TYPE^^}" \
+            -F 'changelog=<dist/changelog.md;type=text/markdown' \
+            -F "file=@dist/OrbZones-$VERSION.jar;type=application/java-archive" \
+            "${form[@]}"
