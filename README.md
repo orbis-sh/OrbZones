@@ -1,7 +1,15 @@
 # OrbZones
 
-OrbZones is a Hytale server plugin for persistent cuboid zones, block
-protection, temporary 3D visualization, and Java enter/leave callbacks.
+OrbZones is a Hytale server mod for protecting builds and defining named areas
+in your world. Select an area in-game, give it a name, and control whether
+players can break, place, or damage blocks inside it. Other mods can use its
+Java API to query zones and react when players enter or leave.
+
+- [Install the JAR](#installation)
+- [Create your first zone](#creating-a-zone)
+- [Commands](#commands) and [permissions](#permissions)
+- [Use OrbZones in another mod](#use-orbzones-in-another-mod)
+- [Build from source](#building-from-source)
 
 ## Features
 
@@ -15,15 +23,28 @@ protection, temporary 3D visualization, and Java enter/leave callbacks.
 
 ## Installation
 
-Build and copy the plugin into the server's `mods` directory:
+### Install the JAR
 
-```powershell
-Set-Location .\Modding\OrbZones
-..\build-mod.ps1
+1. Download `OrbZones-<version>.jar` from the assets on the
+   [GitHub Releases page](https://github.com/orbis-sh/OrbZones/releases).
+   Choose the JAR asset, rather than a source-code ZIP.
+2. Stop your Hytale server.
+3. Place the JAR in your server's `mods/` directory. Create the directory if
+   it does not exist. When updating, replace the old OrbZones JAR so only one
+   version remains installed.
+4. Start the server. The server log should contain `Loaded <count> zones`.
+5. Join with the `orbzones.admin` permission and run `/zone list` to check
+   that OrbZones is available.
+
+```text
+your-server/
+└── mods/
+    └── OrbZones-<version>.jar
 ```
 
-Restart the server after installing or updating the JAR. OrbZones requires
-Java 25 and the Hytale Server API used by this project.
+OrbZones runs on the server; players do not need to install it on their clients.
+Use Java 25 and a Hytale server version compatible with your chosen release.
+No build tools are needed to install a released JAR.
 
 ## Creating a zone
 
@@ -59,6 +80,9 @@ modify. Because a player standing on a floor occupies the air block above it,
 move below the foundation when selecting the lower corner.
 
 New zones protect breaking, placement, and block damage by default.
+
+Zone names can contain 1–32 letters, numbers, underscores, or hyphens, and are
+case-insensitive. For example, `Spawn` and `spawn` refer to the same zone.
 
 To add another cuboid to the same logical zone, select two new corners and run
 `/zone create <name>` again with the same name. Regions in one zone share
@@ -99,6 +123,8 @@ place blocks.
 | `orbzones.bypass` | Allows modifying blocks inside protected zones |
 
 Server operators with the global `*` permission also have access.
+The bypass permission also applies to operators with `*`, so test protection
+with a player who does not have bypass access.
 
 ## Persistence
 
@@ -110,26 +136,53 @@ Stop the server before editing `zones.json` manually. Invalid or incomplete
 data prevents OrbZones from loading rather than silently disabling
 protection.
 
-## Java API
+## Use OrbZones in another mod
 
-Install the OrbZones artifact into the local Maven repository:
+Install the OrbZones JAR on the server alongside your own mod. Use it as a
+compile-time dependency in your project, and declare the runtime dependency
+so Hytale loads OrbZones before your mod. Keep OrbZones out of your mod's
+bundled/shaded JAR.
 
-```powershell
-mvn --batch-mode -DskipTests install
+### 1. Add the compile-time dependency
+
+Use the same OrbZones version for development and on the server. The examples
+below use `1.0.0`; replace it with the version you downloaded.
+
+**Maven:** install the downloaded JAR into your local Maven repository:
+
+```sh
+mvn install:install-file -Dfile=OrbZones-1.0.0.jar -DgroupId=sh.orbis -DartifactId=OrbZones -Dversion=1.0.0 -Dpackaging=jar
 ```
 
-Add it to a consumer plugin:
+Then add this dependency to your mod's `pom.xml`:
 
 ```xml
 <dependency>
     <groupId>sh.orbis</groupId>
     <artifactId>OrbZones</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <version>1.0.0</version>
     <scope>provided</scope>
 </dependency>
 ```
 
-Declare the runtime plugin dependency in the consumer's `manifest.json`:
+This uses your local Maven repository; repeat the install step on other build
+machines, including CI, that need to compile your mod.
+
+**Gradle (Kotlin DSL):** copy the downloaded JAR into your project's `libs/`
+directory and add it to `build.gradle.kts`:
+
+```kotlin
+dependencies {
+    compileOnly(files("libs/OrbZones-1.0.0.jar"))
+}
+```
+
+Your project also needs its normal Hytale Server API dependency and Java 25.
+
+### 2. Declare the runtime dependency
+
+Merge this entry into your mod's `manifest.json`, keeping any existing
+dependencies:
 
 ```json
 {
@@ -139,9 +192,13 @@ Declare the runtime plugin dependency in the consumer's `manifest.json`:
 }
 ```
 
-### Enter and leave callbacks
+### 3. Listen for players entering and leaving
+
+Add the following members to your `JavaPlugin` subclass, merging the lifecycle
+methods with any existing setup and shutdown logic:
 
 ```java
+import com.hypixel.hytale.server.core.Message;
 import sh.orbis.orbzones.OrbZonesPlugin;
 import sh.orbis.orbzones.api.ZoneListener;
 import sh.orbis.orbzones.api.ZoneListenerRegistration;
@@ -156,14 +213,14 @@ protected void setup() {
             .registerListener(new ZoneListener() {
                 @Override
                 public void onEnter(ZoneTransitionEvent event) {
-                    String player = event.player().getUsername();
-                    String zone = event.zone().name();
+                    event.player().sendMessage(
+                            Message.raw("Entered " + event.zone().name()));
                 }
 
                 @Override
                 public void onLeave(ZoneTransitionEvent event) {
-                    String player = event.player().getUsername();
-                    String zone = event.zone().name();
+                    event.player().sendMessage(
+                            Message.raw("Left " + event.zone().name()));
                 }
             });
 }
@@ -184,16 +241,41 @@ Disconnecting while inside a zone also produces a matching leave callback.
 ### Querying zones
 
 ```java
-var zones = OrbZonesPlugin.get()
-        .getZoneManager()
-        .findContaining(worldName, blockPosition);
+import sh.orbis.orbzones.OrbZonesPlugin;
+import sh.orbis.orbzones.api.BlockPosition;
+import sh.orbis.orbzones.api.ZoneAction;
 
-var zone = OrbZonesPlugin.get()
-        .getZoneManager()
-        .getByName("StaticBuilding");
+// Inside a method; use your world's name and the block coordinates to check.
+var manager = OrbZonesPlugin.get().getZoneManager();
+var position = new BlockPosition(100, 64, 100);
+var zones = manager.findContaining(worldName, position);
+var zone = manager.getByName("StaticBuilding"); // Optional<Zone>
+boolean protectsBreaking = manager.isProtected(worldName, position, ZoneAction.BREAK);
 ```
 
 `findContaining` returns every matching zone. Block modification is denied
 when any matching zone protects that action. `Zone.regions()` exposes the
 individual cuboids; `Zone.min()` and `Zone.max()` return aggregate bounds
 covering every region.
+
+`isProtected` checks the zone settings, not a particular player's bypass
+permission. Access the manager after OrbZones has completed setup, such as in
+your dependent mod's `setup()` method, rather than in a static initializer.
+
+### Creating and updating zones
+
+Mods can also manage zones directly through `ZoneManager`:
+
+```java
+// Inside a method that handles or declares IOException.
+var manager = OrbZonesPlugin.get().getZoneManager();
+manager.create("Spawn", worldName,
+        new BlockPosition(0, 60, 0),
+        new BlockPosition(20, 80, 20));
+manager.setProtection("Spawn", ZoneAction.PLACE, false);
+```
+
+`create` adds a region when the name already exists; that region must be in the
+same world and must not overlap another region of that zone. Use
+`manager.delete("Spawn")` to remove a zone and all its regions. These changes
+are saved immediately and can throw `IOException` if saving fails.
